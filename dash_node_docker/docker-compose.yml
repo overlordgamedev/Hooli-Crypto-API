@@ -1,0 +1,15 @@
+version: "3.8"
+
+services:
+  dash_node:
+    build: .
+    container_name: dash_node
+    ports:
+      - "9998:9998"  # RPC порт
+      - "9999:9999"  # Порт для p2p соединений mainnet
+    volumes:
+      - dash_data:/root/.dashcore
+    restart: unless-stopped
+
+volumes:
+  dash_data:
