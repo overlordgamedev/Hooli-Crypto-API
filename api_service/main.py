@@ -1,6 +1,6 @@
 import uvicorn
 from starlette.middleware.sessions import SessionMiddleware
-from routers import dash_api, panel
+from routers import dash_api, panel, universal
 from fastapi import FastAPI
 
 # Инициализация FastAPI с параметром кастомного заголовка на странице документации.
@@ -15,6 +15,7 @@ app.add_middleware(SessionMiddleware, secret_key="your-secret-key")
 
 # Маршрутизатор (include_router) основного приложения с которым будут связанны сторонние маршруты из других файлов
 app.include_router(dash_api.router)
+app.include_router(universal.router)
 app.include_router(panel.router, include_in_schema=False)
 
 

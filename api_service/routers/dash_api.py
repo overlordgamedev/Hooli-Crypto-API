@@ -1,11 +1,18 @@
 import secrets
 from fastapi import HTTPException, Query, Depends, APIRouter
 from sqlalchemy.orm import Session
-from models import User, get_db, DWallet
+from check_uuid import check_uuid
+from models import get_db, DWallet
 import time
 import requests
+import hashlib
+import base58
+from mnemonic import Mnemonic
+from bip32utils import BIP32Key
 
 router = APIRouter()
+#TODO: после использования локальных кошельков нужно из них выходить, а перед использованием других, заходить и в конце опять выходить
+# Также есть проблема с проверкой мнемонических фраз, оно проверяет только внешние адреса, то есть те, на которые кидают деньги извне а не для внутренних транзакций (не критично)
 
 # Настройки для RPC
 URL = "http://localhost:9998/"
@@ -37,20 +44,13 @@ def rpc_call(method: str, params: list = None, wallet_name: str = None):
         return {"error": str(e)}
 
 
-# Функция для проверки UUID пользователя
-def verify_user_uuid(user_uuid: str, db: Session = Depends(get_db)):
-    # Создается запрос к таблице из модели (класса) User и ищется поле unique_id с таким же значением как передаваемый user_uuid
-    db_user = db.query(User).filter(User.unique_id == user_uuid).first()
-    if not db_user:
-        # Если uuid не найден, то выводить ошибку
-        raise HTTPException(status_code=403, detail="Invalid or unauthorized UUID.")
-    return db_user
-
-
 @router.get("/api/v1/create_wallet", tags=["DASH WALLET"])  # Параметр tags=["DASH WALLET"] позволяет выносить этот блок в отдельный раздел в документации
-async def create_wallet(user_uuid: str = Query(..., description="UUID"), db: Session = Depends(get_db)):
+async def create_wallet(
+        user_uuid: str = Query(..., description="UUID"),
+        db: Session = Depends(get_db)
+):
     # Вызов функции проверки uuid, передавая в нее user_uuid из запроса и сессию
-    verify_user_uuid(user_uuid, db)
+    check_uuid(user_uuid, db)
 
     # Проверка количества кошельков для данного пользователя
     wallet_count = db.query(DWallet).filter(DWallet.user_unique_id == user_uuid).count()
@@ -87,7 +87,6 @@ async def create_wallet(user_uuid: str = Query(..., description="UUID"), db: Ses
     # Парсит ответа от rcp_call и вытаскивает из него значение ключа ["result"]
     privkey = privkey_result["result"]
 
-
     # Получение публичного ключа
     method = "getaddressinfo"
     params = [address]  # Сгенерированный выше кошелек
@@ -95,7 +94,6 @@ async def create_wallet(user_uuid: str = Query(..., description="UUID"), db: Ses
     pubkey_result = rpc_call(method, params, wallet_name=wallet_name)
     # Парсит ответа от rcp_call и вытаскивает из него ключа ["result"] и из него вытаскивает значение ключа ("pubkey")
     pubkey = pubkey_result["result"].get("pubkey")
-
 
     # Возвращаем все данные
     return {
@@ -114,7 +112,7 @@ async def import_private_key(
     db: Session = Depends(get_db)
 ):
     # Проверка UUID пользователя
-    verify_user_uuid(user_uuid, db)
+    check_uuid(user_uuid, db)
 
     # Проверка, принадлежит ли кошелек указанному пользователю
     wallet = db.query(DWallet).filter(DWallet.wallet_name == wallet_name, DWallet.user_unique_id == user_uuid).first()
@@ -139,6 +137,48 @@ async def import_private_key(
     return {"status": "success", "data": result["result"]}
 
 
+@router.get("/api/v1/import_mnemonic_phrase", tags=["DASH WALLET"])
+async def import_mnemonic_phrase(
+    mnemonic_phrase: str = Query(..., description="Мнемоническая фраза"),
+    user_uuid: str = Query(..., description="UUID"),
+    db: Session = Depends(get_db)
+):
+    # Вызов функции проверки uuid, передавая в нее user_uuid из запроса и сессию
+    check_uuid(user_uuid, db)
+
+    # Проверка количества кошельков для данного пользователя
+    wallet_count = db.query(DWallet).filter(DWallet.user_unique_id == user_uuid).count()
+    if wallet_count >= 5:
+        return {"error": "Превышен лимит кошельков. У пользователя не может быть более 5 кошельков."}
+
+    # Генерация случайного имени кошелька
+    wallet_name = "dhdwallet_" + secrets.token_hex(8)  # Генерация случайного имени кошелька
+
+    # Создание нового кошелька через отправку команды RCP в ноду
+    method = "createwallet"
+    params = [wallet_name, False, True]  # Имя кошелька
+    rpc_call(method, params)  # Вызов метода для отправки команды RCP в ноду
+
+    # Добавление кошелька в базу данных
+    new_wallet = DWallet(wallet_name=wallet_name, user_unique_id=user_uuid)
+    db.add(new_wallet)
+    db.commit()
+    db.refresh(new_wallet)
+
+    # Импорт мнемонической фразы в новый кошелек
+    method = "upgradetohd"
+    params = [mnemonic_phrase, ""]
+    result = rpc_call(method, params, wallet_name=wallet_name)
+
+    # Проверка на ошибки
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result["error"])
+
+    return {"status": "success",
+            "wallet_name": wallet_name,
+            "data": result["result"],}
+
+
 @router.get("/api/v1/check_balance_wallet", tags=["DASH WALLET"])
 async def check_balance_wallet(
     wallet_name: str = Query(..., description="Название кошелька"),
@@ -146,7 +186,7 @@ async def check_balance_wallet(
     db: Session = Depends(get_db)
 ):
     # Проверка UUID пользователя
-    verify_user_uuid(user_uuid, db)
+    check_uuid(user_uuid, db)
 
     # Проверка, принадлежит ли кошелек указанному пользователю
     wallet = db.query(DWallet).filter(DWallet.wallet_name == wallet_name, DWallet.user_unique_id == user_uuid).first()
@@ -183,7 +223,7 @@ async def send_transaction_wallet(
     db: Session = Depends(get_db)
 ):
     # Проверка UUID пользователя
-    verify_user_uuid(user_uuid, db)
+    check_uuid(user_uuid, db)
 
     # Проверка, принадлежит ли кошелек указанному пользователю
     wallet = db.query(DWallet).filter(DWallet.wallet_name == wallet_name, DWallet.user_unique_id == user_uuid).first()
@@ -202,6 +242,140 @@ async def send_transaction_wallet(
     return result["result"]
 
 
+@router.get("/api/v1/address_list", tags=["DASH WALLET"])
+async def address_list(
+    wallet_name: str = Query(..., description="Название кошелька"),
+    user_uuid: str = Query(..., description="UUID"),
+    db: Session = Depends(get_db)
+):
+    # Проверка UUID
+    check_uuid(user_uuid, db)
+
+    # Проверка, принадлежит ли кошелек указанному пользователю
+    wallet = db.query(DWallet).filter(DWallet.wallet_name == wallet_name, DWallet.user_unique_id == user_uuid).first()
+
+    if not wallet:
+        return {"error": "Кошелек с указанным именем не найден у пользователя с данным UUID."}
+
+    method = "listaddressgroupings"
+    result = rpc_call(method, wallet_name=wallet_name)
+
+    return result["result"]
+
+
+@router.get("/api/v1/wallets_list", tags=["DASH WALLET"])
+async def wallets_list(
+    user_uuid: str = Query(..., description="UUID"),
+        db: Session = Depends(get_db)
+):
+    # Проверяем, существуют ли кошельки с этим UUID
+    wallets = db.query(DWallet).filter(DWallet.user_unique_id == user_uuid).all()
+
+    # Если кошельков нет, возвращаем ошибку
+    if not wallets:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Кошельки для пользователя с UUID {user_uuid} не найдены."
+        )
+
+    # Возвращаем список названий кошельков
+    return [wallet.wallet_name for wallet in wallets]
+
+
+@router.get("/api/v1/check_mnemonic", tags=["DASH"])
+async def check_mnemonic(
+        mnemonic_phrase: str = Query(..., description="Мнемоническая фраза"),
+        start_index: int = Query(0, description="Начальный индекс адреса"),
+        amount_address: int = Query(100, description="Количество проверяемых адресов"),
+        user_uuid: str = Query(..., description="UUID"),
+        db: Session = Depends(get_db)
+):
+    # Проверка UUID пользователя
+    check_uuid(user_uuid, db)
+
+    # Переменная для хранения общего баланса
+    total_balance = 0
+
+    # Список для хранения адресов и приватных ключей
+    addresses_with_keys = []
+
+    # Преобразуем мнемоническую фразу в seed (в байтовое представление)
+    seed = Mnemonic("english").to_seed(mnemonic_phrase)
+
+    # Генерация корневого ключа из seed
+    root_key = BIP32Key.fromEntropy(seed)
+
+    # Генерация указанного количества адресов
+    for index in range(start_index, start_index + amount_address):
+        # Деривация публичного ключа
+        pubkey = root_key.ChildKey(44 + 0x80000000).ChildKey(5 + 0x80000000).ChildKey(0 + 0x80000000).ChildKey(0).ChildKey(index).PublicKey()
+
+        # Хешируем публичный ключ с использованием алгоритмов SHA-256 и RIPEMD-160
+        ripemd160_hash = hashlib.new('ripemd160', hashlib.sha256(pubkey).digest()).digest()
+        # Добавляем к хешируемому публичному ключу \x4c что бы указать что это ключ для dash (BTC-\x00, LTC-\x30)
+        payload = b'\x4c' + ripemd160_hash
+        # Хэшируем payload (\x4c + хеш публичного ключа) с помощью SHA-256
+        first_sha256 = hashlib.sha256(payload).digest()
+        # Хэшируем first_sha256, то есть хешируем другой хеш, это делается для усиления защиты
+        second_sha256 = hashlib.sha256(first_sha256).digest()
+        # Берем первые 4 байта от получившегося хеша second_sha256, получается контрольная сумма
+        checksum = second_sha256[:4]
+        # Формируем итоговый адрес, добавляя контрольную сумму к payload (хеш публичного ключа + \x4c)
+        address_with_checksum = payload + checksum
+        # Кодируем адрес в формате Base58Check
+        dash_address = base58.b58encode(address_with_checksum).decode('utf-8')
+
+        # Деривация приватного ключа
+        private_key_bytes = root_key.ChildKey(44 + 0x80000000).ChildKey(5 + 0x80000000).ChildKey(0 + 0x80000000).ChildKey(0).ChildKey(index).PrivateKey()
+
+        # Добавляем байт 0x01 для того что бы указать что приватный ключ в сжатом формате
+        private_key_compressed = private_key_bytes + b'\x01'
+        # Добавляем к приватному ключу в начале \xCC что бы указать что это ключ для dash
+        private_payload = b'\xCC' + private_key_compressed  # Префикс Dash приватного ключа
+        # Хэшируем private_payload с помощью SHA-256
+        private_first_sha256 = hashlib.sha256(private_payload).digest()
+        # Хэшируем полученный выше хэш
+        private_second_sha256 = hashlib.sha256( private_first_sha256).digest()
+        # Берем первые 4 байта от получившегося хеша private_second_sha256, получается контрольная сумма
+        checksum = private_second_sha256[:4]
+        # Формируем итоговый приватный ключ, добавляя контрольную сумму к private_payload
+        private_key_with_checksum = private_payload + checksum
+        # Кодируем адрес в формате Base58Check
+        private_key = base58.b58encode(private_key_with_checksum).decode('utf-8')
+
+        # Запрос баланса
+        method = "getaddressbalance"
+        params = [dash_address]
+        result = rpc_call(method, params)
+
+        if result.get("error") is not None:
+            raise HTTPException(status_code=400, detail=result["error"])
+
+        if not isinstance(result.get("result"), dict):
+            raise HTTPException(status_code=400, detail="Неверный формат данных в ответе RPC.")
+
+        # Получаем баланс
+        balance = result.get("result", {}).get("balance", 0)
+
+        # Суммируем баланс
+        total_balance += balance
+
+        # Добавляем данные в список
+        addresses_with_keys.append({
+            "address": dash_address,
+            "private_key": private_key,
+            "balance_satoshi": balance,
+            "balance": balance / 100000000
+        })
+
+    # Возвращаем общий баланс и список адресов с ключами
+    return {
+        "total_balance_satoshi": total_balance,
+        "total_balance": total_balance / 100000000,
+        "addresses": addresses_with_keys
+    }
+
+
 @router.get("/api/v1/check_balance", tags=["DASH"])
 async def check_balance(
     address: str = Query(..., description="Адрес для проверки баланса"),
@@ -209,7 +383,7 @@ async def check_balance(
     db: Session = Depends(get_db)
 ):
     # Вызов функции проверки uuid, передавая в нее user_uuid из запроса и сессию
-    verify_user_uuid(user_uuid, db)
+    check_uuid(user_uuid, db)
 
     # Передача данных в функцию отправки запроса на ноду (rpc_call)
     method = "getaddressbalance" # Команда для получения баланса
@@ -233,7 +407,7 @@ async def check_transaction(
     db: Session = Depends(get_db)
 ):
     # Вызов функции проверки uuid, передавая в нее user_uuid из запроса и сессию
-    verify_user_uuid(user_uuid, db)
+    check_uuid(user_uuid, db)
 
     # Передача данных в функцию отправки запроса на ноду (rpc_call)
     method = "getrawtransaction" # Команда для получения информации о транзакции по ее хэшу
@@ -257,7 +431,7 @@ async def check_utxo(
     db: Session = Depends(get_db)
 ):
     # Вызов функции проверки uuid, передавая в нее user_uuid из запроса и сессию
-    verify_user_uuid(user_uuid, db)
+    check_uuid(user_uuid, db)
     address_list = addresses.split(",") # Разбивает кошельки через запятую чтобы была возможность отправлять несколько сразу
 
     # Передача данных в функцию отправки запроса на ноду (rpc_call)
@@ -282,7 +456,7 @@ async def balance_history(
     db: Session = Depends(get_db)
 ):
     # Вызов функции проверки uuid, передавая в нее user_uuid из запроса и сессию
-    verify_user_uuid(user_uuid, db)
+    check_uuid(user_uuid, db)
     address_list = addresses.split(",")  # Разбивает кошельки через запятую чтобы была возможность отправлять несколько сразу
 
     # Передача данных в функцию отправки запроса на ноду (rpc_call)
@@ -311,7 +485,7 @@ async def create_transaction_auto_fee(
         db: Session = Depends(get_db)
 ):
     # Вызов функции проверки uuid, передавая в нее user_uuid из запроса и сессию
-    verify_user_uuid(user_uuid, db)
+    check_uuid(user_uuid, db)
 
     # Передача данных в функцию отправки запроса на ноду (rpc_call)
     method = "getaddressutxos"  # Команда для получения всех входов конкретного кошелька
@@ -383,14 +557,14 @@ async def create_transaction_auto_fee(
 
     return {
         "raw_transaction": result["result"],
-        "total_balance": total_balance,
-        "amount": amount,
-        "fee_rate": fee_rate,
-        "spend_change": spend_change,
-        "total_balance_satoshi": total_balance / 100000000,
-        "amount_satoshi": amount / 100000000,
-        "fee_rate_satoshi": fee_rate / 100000000,
-        "spend_change_satoshi": spend_change / 100000000
+        "total_balance_satoshi": total_balance,
+        "amount_satoshi": amount,
+        "fee_rate_satoshi": fee_rate,
+        "spend_change_satoshi": spend_change,
+        "total_balance": total_balance / 100000000,
+        "amount": amount / 100000000,
+        "fee_rate": fee_rate / 100000000,
+        "spend_change": spend_change / 100000000
     }
 
 
@@ -406,7 +580,7 @@ async def create_transaction(
         db: Session = Depends(get_db)
 ):
     # Вызов функции проверки uuid, передавая в нее user_uuid из запроса и сессию
-    verify_user_uuid(user_uuid, db)
+    check_uuid(user_uuid, db)
 
     # Передача данных в функцию отправки запроса на ноду (rpc_call)
     method = "getaddressutxos"  # Команда для получения всех входов конкретного кошелька
@@ -471,14 +645,14 @@ async def create_transaction(
 
     return {
         "raw_transaction": result["result"],
-        "total_balance": total_balance,
-        "amount": amount,
-        "fee_rate": fee_rate,
-        "spend_change": spend_change,
-        "total_balance_satoshi": total_balance / 100000000,
-        "amount_satoshi": amount / 100000000,
-        "fee_rate_satoshi": fee_rate / 100000000,
-        "spend_change_satoshi": spend_change / 100000000
+        "total_balance_satoshi": total_balance,
+        "amount_satoshi": amount,
+        "fee_rate_satoshi": fee_rate,
+        "spend_change_satoshi": spend_change,
+        "total_balance": total_balance / 100000000,
+        "amount": amount / 100000000,
+        "fee_rate": fee_rate / 100000000,
+        "spend_change": spend_change / 100000000
     }
 
 
@@ -491,7 +665,7 @@ async def sign_transaction(
     db: Session = Depends(get_db)
 ):
     # Вызов функции проверки uuid, передавая в нее user_uuid из запроса и сессию
-    verify_user_uuid(user_uuid, db)
+    check_uuid(user_uuid, db)
 
     method = "signrawtransactionwithkey"  # RCP команда для подписания транзакций
     params = [raw_transaction, [private_key]]  # Передача хэша транзакции и првиатного ключа необходимого для подписания
@@ -515,7 +689,7 @@ async def broadcast_transaction(
     db: Session = Depends(get_db)
 ):
     # Вызов функции проверки uuid, передавая в нее user_uuid из запроса и сессию
-    verify_user_uuid(user_uuid, db)
+    check_uuid(user_uuid, db)
 
     method = "sendrawtransaction"  # RCP команда для отправки подписанной транзакции в блок
     params = [str(signed_raw_transaction), 0, False, False]  # Передается подписанная транзакция
@@ -530,7 +704,7 @@ async def block_info(
     db: Session = Depends(get_db)
 ):
     # Вызов функции проверки uuid, передавая в нее user_uuid из запроса и сессию
-    verify_user_uuid(user_uuid, db)
+    check_uuid(user_uuid, db)
 
     method = "getblock"  # Команда для получения информации о блоке по его хэшу
     params = [block_hash]
@@ -551,7 +725,7 @@ async def sync_status(
     db: Session = Depends(get_db)
 ):
     # Вызов функции проверки uuid, передавая в нее user_uuid из запроса и сессию
-    verify_user_uuid(user_uuid, db)
+    check_uuid(user_uuid, db)
 
     method = "getblockchaininfo"  # Команда для получения информации о ноде
     result = rpc_call(method)
@@ -574,7 +748,7 @@ async def start_mixing(
     db: Session = Depends(get_db)
 ):
     # Проверка UUID пользователя
-    verify_user_uuid(user_uuid, db)
+    check_uuid(user_uuid, db)
 
     # Проверка, принадлежит ли кошелек указанному пользователю
     wallet = db.query(DWallet).filter(DWallet.wallet_name == wallet_name, DWallet.user_unique_id == user_uuid).first()
@@ -616,7 +790,7 @@ async def stop_mixing(
     db: Session = Depends(get_db)
 ):
     # Проверка UUID пользователя
-    verify_user_uuid(user_uuid, db)
+    check_uuid(user_uuid, db)
 
     # Проверка, принадлежит ли кошелек указанному пользователю
     wallet = db.query(DWallet).filter(DWallet.wallet_name == wallet_name, DWallet.user_unique_id == user_uuid).first()
